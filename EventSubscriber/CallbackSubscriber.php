@@ -12,9 +12,13 @@ namespace MauticPlugin\AmazonSesBundle\EventSubscriber;
 
 use Mautic\CoreBundle\Helper\CoreParametersHelper;
 use Mautic\EmailBundle\EmailEvents;
+use Mautic\EmailBundle\Entity\Stat;
 use Mautic\EmailBundle\Event\TransportWebhookEvent;
+use Mautic\EmailBundle\Model\EmailStatModel;
 use Mautic\EmailBundle\Model\TransportCallback;
+use Mautic\EmailBundle\MonitoredEmail\Search\ContactFinder;
 use Mautic\LeadBundle\Entity\DoNotContact;
+use Mautic\LeadBundle\Model\DoNotContact as DoNotContactModel;
 use MauticPlugin\AmazonSesBundle\Mailer\Transport\AmazonSesTransport;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
@@ -36,6 +40,9 @@ class CallbackSubscriber implements EventSubscriberInterface
         private TransportCallback $transportCallback,
         private CoreParametersHelper $coreParametersHelper,
         private HttpClientInterface $client,
+        private EmailStatModel $emailStatModel,
+        private ContactFinder $contactFinder,
+        private DoNotContactModel $dncModel,
         TranslatorInterface $translator,
         ?LoggerInterface $logger = null,
     ) {
@@ -65,9 +72,18 @@ class CallbackSubscriber implements EventSubscriberInterface
 
         try {
             $snsreq  = $event->getRequest();
-            $payload = json_decode($snsreq->getContent(), true, 512, JSON_THROW_ON_ERROR);
+            $rawContent = $snsreq->getContent();
+            
+            // Log the raw webhook payload
+            $this->logger->debug('SNS Raw Payload: ' . $rawContent);
+            
+            $payload = json_decode($rawContent, true, 512, JSON_THROW_ON_ERROR);
+            
+            // Log the parsed payload
+            $this->logger->debug('SNS Parsed Payload: ' . json_encode($payload, JSON_PRETTY_PRINT));
+            
         } catch (\Exception $e) {
-            $this->logger->error('SNS: Invalid JSON Payload');
+            $this->logger->error('SNS: Invalid JSON Payload: ' . $e->getMessage());
             $event->setResponse(
                 $this->createResponse(
                     $this->translator->trans('mautic.amazonses.plugin.sns.callback.json.invalid', [], 'validators'),
@@ -187,10 +203,12 @@ class CallbackSubscriber implements EventSubscriberInterface
                 $typeFound = true;
 
                 try {
+                    $this->logger->debug('Processing Notification payload');
                     $message = json_decode($payload['Message'], true, 512, JSON_THROW_ON_ERROR);
+                    $this->logger->debug('Parsed notification message: ' . json_encode($message, JSON_PRETTY_PRINT));
                     $this->processJsonPayload($message, $message['notificationType']);
                 } catch (\Exception $e) {
-                    $this->logger->error('AmazonCallback: Invalid Notification JSON Payload');
+                    $this->logger->error('AmazonCallback: Invalid Notification JSON Payload: ' . $e->getMessage());
                     $hasError = true;
                     $message  = $this->translator->trans('mautic.amazonses.plugin.sns.callback.notification.json_invalid', [], 'validators');
                 }
@@ -214,8 +232,14 @@ class CallbackSubscriber implements EventSubscriberInterface
                     // http://docs.aws.amazon.com/ses/latest/DeveloperGuide/notification-contents.html#complaint-object
                     // abuse / auth-failure / fraud / not-spam / other / virus
                     $complianceCode = array_key_exists('complaintFeedbackType', $payload['complaint']) ? $payload['complaint']['complaintFeedbackType'] : 'unknown';
-                    $this->transportCallback->addFailureByAddress($this->cleanupEmailAddress($complaintRecipient['emailAddress']), $complianceCode, DoNotContact::UNSUBSCRIBED, $emailId);
-                    $this->logger->debug("Mark email '".$complaintRecipient['emailAddress']."' has complained, reason: ".$complianceCode);
+                    
+                    $cleanEmail = $this->cleanupEmailAddress($complaintRecipient['emailAddress']);
+                    $this->logger->debug("Processing complaint for address={$cleanEmail}, emailId={$emailId}");
+                    
+                    // Handle complaint with proper email stat correlation  
+                    $this->processComplaintWithEmailId($cleanEmail, $complianceCode, $emailId);
+                    
+                    $this->logger->debug("Mark email '{$cleanEmail}' as complained, reason: {$complianceCode}");
                 }
                 break;
 
@@ -224,13 +248,22 @@ class CallbackSubscriber implements EventSubscriberInterface
                 if ('Permanent' == $payload['bounce']['bounceType']) {
                     $emailId           = $this->getEmailHeader($payload);
                     $bouncedRecipients = $payload['bounce']['bouncedRecipients'];
+                    
+                    // Debug logging
+                    $this->logger->debug("Processing bounce with emailId: " . ($emailId ? $emailId : 'NULL'));
+                    
                     foreach ($bouncedRecipients as $bouncedRecipient) {
                         $bounceSubType    = $payload['bounce']['bounceSubType'];
                         $bounceDiagnostic = array_key_exists('diagnosticCode', $bouncedRecipient) ? $bouncedRecipient['diagnosticCode'] : 'unknown';
                         $bounceCode       = 'AWS: '.$bounceSubType.': '.$bounceDiagnostic;
 
-                        $this->transportCallback->addFailureByAddress($this->cleanupEmailAddress($bouncedRecipient['emailAddress']), $bounceCode, DoNotContact::BOUNCED, $emailId);
-                        $this->logger->debug("Mark email '".$this->cleanupEmailAddress($bouncedRecipient['emailAddress'])."' as bounced, reason: ".$bounceCode);
+                        $cleanEmail = $this->cleanupEmailAddress($bouncedRecipient['emailAddress']);
+                        $this->logger->debug("Processing bounce for address={$cleanEmail}, emailId={$emailId}");
+                        
+                        // Handle bounce with proper email stat correlation
+                        $this->processBounceWithEmailId($cleanEmail, $bounceCode, $emailId);
+                        
+                        $this->logger->debug("Mark email '{$cleanEmail}' as bounced, reason: {$bounceCode}");
                     }
                 }
                 break;
@@ -262,13 +295,129 @@ class CallbackSubscriber implements EventSubscriberInterface
 
     public function getEmailHeader($payload)
     {
+        $this->logger->debug('getEmailHeader called');
+        
         if (!isset($payload['mail']['headers'])) {
+            $this->logger->debug('No mail.headers found in payload');
             return null;
+        }
+
+        $this->logger->debug('Found ' . count($payload['mail']['headers']) . ' headers in payload');
+        
+        // Log all headers for debugging
+        foreach ($payload['mail']['headers'] as $header) {
+            $this->logger->debug('Header: ' . $header['name'] . ' = ' . $header['value']);
         }
 
         foreach ($payload['mail']['headers'] as $header) {
             if ('X-EMAIL-ID' === strtoupper($header['name'])) {
+                $this->logger->debug('Found X-EMAIL-ID header with value: ' . $header['value']);
                 return $header['value'];
+            }
+        }
+        
+        $this->logger->debug('X-EMAIL-ID header not found');
+        return null;
+    }
+
+    /**
+     * Process bounce with email ID correlation - enhanced version that works within plugin
+     */
+    private function processBounceWithEmailId(string $emailAddress, string $bounceCode, ?string $emailId): void
+    {
+        $this->logger->debug("processBounceWithEmailId called with address={$emailAddress}, emailId=" . ($emailId ?: 'NULL'));
+        
+        if (!$emailId) {
+            // Fall back to standard method if no email ID
+            $this->transportCallback->addFailureByAddress($emailAddress, $bounceCode, DoNotContact::BOUNCED);
+            return;
+        }
+
+        // Try to find the specific email stat using email ID and address
+        $stat = $this->emailStatModel->getRepository()->findOneBy([
+            'email' => $emailId,
+            'emailAddress' => $emailAddress
+        ]);
+
+        if ($stat) {
+            $this->logger->debug("Found specific stat (ID: {$stat->getId()}) for email {$emailId} and address {$emailAddress}");
+            
+            // Update the stat directly (like TransportCallback::updateStatDetails does)
+            $stat->setIsFailed(true);
+            
+            $openDetails = $stat->getOpenDetails();
+            if (!isset($openDetails['bounces'])) {
+                $openDetails['bounces'] = [];
+            }
+            $openDetails['bounces'][] = [
+                'datetime' => (new \DateTime())->format('Y-m-d H:i:s'),
+                'reason'   => $bounceCode,
+            ];
+            $stat->setOpenDetails($openDetails);
+            $this->emailStatModel->saveEntity($stat);
+            
+            // Set DNC for the contact with proper email channel
+            $contact = $stat->getLead();
+            if ($contact) {
+                $channel = ['email' => (int)$emailId];
+                $this->logger->debug("Setting DNC for contact {$contact->getId()} with channel: " . json_encode($channel));
+                $this->dncModel->addDncForContact($contact->getId(), $channel, DoNotContact::BOUNCED, $bounceCode);
+            }
+        } else {
+            $this->logger->debug("No specific stat found for email {$emailId} and address {$emailAddress}, using fallback");
+            
+            // Fall back to finding contacts by address and setting DNC with email channel
+            $result = $this->contactFinder->findByAddress($emailAddress);
+            if ($contacts = $result->getContacts()) {
+                foreach ($contacts as $contact) {
+                    $channel = ['email' => (int)$emailId];
+                    $this->logger->debug("Setting DNC for contact {$contact->getId()} with channel: " . json_encode($channel));
+                    $this->dncModel->addDncForContact($contact->getId(), $channel, DoNotContact::BOUNCED, $bounceCode);
+                }
+            }
+        }
+    }
+
+    /**
+     * Process complaint with email ID correlation
+     */
+    private function processComplaintWithEmailId(string $emailAddress, string $complaintCode, ?string $emailId): void
+    {
+        $this->logger->debug("processComplaintWithEmailId called with address={$emailAddress}, emailId=" . ($emailId ?: 'NULL'));
+        
+        if (!$emailId) {
+            // Fall back to standard method if no email ID
+            $this->transportCallback->addFailureByAddress($emailAddress, $complaintCode, DoNotContact::UNSUBSCRIBED);
+            return;
+        }
+
+        // Try to find the specific email stat using email ID and address
+        $stat = $this->emailStatModel->getRepository()->findOneBy([
+            'email' => $emailId,
+            'emailAddress' => $emailAddress
+        ]);
+
+        if ($stat) {
+            $this->logger->debug("Found specific stat (ID: {$stat->getId()}) for email {$emailId} and address {$emailAddress}");
+            
+            // Set DNC for the contact with proper email channel
+            $contact = $stat->getLead();
+            if ($contact) {
+                $channel = ['email' => (int)$emailId];
+                $this->logger->debug("Setting DNC (UNSUBSCRIBED) for contact {$contact->getId()} with channel: " . json_encode($channel));
+                $this->dncModel->addDncForContact($contact->getId(), $channel, DoNotContact::UNSUBSCRIBED, $complaintCode);
+            }
+        } else {
+            $this->logger->debug("No specific stat found for email {$emailId} and address {$emailAddress}, using fallback");
+            
+            // Fall back to finding contacts by address and setting DNC with email channel
+            $result = $this->contactFinder->findByAddress($emailAddress);
+            if ($contacts = $result->getContacts()) {
+                foreach ($contacts as $contact) {
+                    $channel = ['email' => (int)$emailId];
+                    $this->logger->debug("Setting DNC (UNSUBSCRIBED) for contact {$contact->getId()} with channel: " . json_encode($channel));
+                    $this->dncModel->addDncForContact($contact->getId(), $channel, DoNotContact::UNSUBSCRIBED, $complaintCode);
+                }
             }
         }
     }

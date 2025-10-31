@@ -31,6 +31,12 @@ return static function (ContainerConfigurator $configurator) {
     $services->load('MauticPlugin\\AmazonSesBundle\\', '../')
         ->exclude('../{'.implode(',', array_merge(MauticCoreExtension::DEFAULT_EXCLUDES, $excludes)).'}');
 
+    // Configure CallbackSubscriber with additional dependencies for email stat correlation
+    $services->get(\MauticPlugin\AmazonSesBundle\EventSubscriber\CallbackSubscriber::class)
+        ->arg('$emailStatModel', service(\Mautic\EmailBundle\Model\EmailStatModel::class))
+        ->arg('$contactFinder', service(\Mautic\EmailBundle\MonitoredEmail\Search\ContactFinder::class))
+        ->arg('$dncModel', service(\Mautic\LeadBundle\Model\DoNotContact::class));
+
     $services->get(\MauticPlugin\AmazonSesBundle\Mailer\Factory\AmazonSesTransportFactory::class)
     ->autowire(false) 
     ->arg('$transportCallback', service(\Mautic\EmailBundle\Model\TransportCallback::class))
