@@ -70,17 +70,23 @@ class CallbackSubscriber implements EventSubscriberInterface
 
         $this->logger->debug('start processCallbackRequest - Amazon SNS Webhook');
 
+        // Simple file-based logging for debugging
+        $debugLogFile = '/tmp/mautic_sns_debug.log';
+        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] SNS Webhook called\n", FILE_APPEND | LOCK_EX);
+
         try {
             $snsreq  = $event->getRequest();
             $rawContent = $snsreq->getContent();
             
             // Log the raw webhook payload
             $this->logger->debug('SNS Raw Payload: ' . $rawContent);
+            file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Raw payload: " . $rawContent . "\n", FILE_APPEND | LOCK_EX);
             
             $payload = json_decode($rawContent, true, 512, JSON_THROW_ON_ERROR);
             
             // Log the parsed payload
             $this->logger->debug('SNS Parsed Payload: ' . json_encode($payload, JSON_PRETTY_PRINT));
+            file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Parsed payload: " . json_encode($payload, JSON_PRETTY_PRINT) . "\n", FILE_APPEND | LOCK_EX);
             
         } catch (\Exception $e) {
             $this->logger->error('SNS: Invalid JSON Payload: ' . $e->getMessage());
@@ -250,6 +256,8 @@ class CallbackSubscriber implements EventSubscriberInterface
                     $bouncedRecipients = $payload['bounce']['bouncedRecipients'];
                     
                     // Debug logging
+                    $debugLogFile = '/tmp/mautic_sns_debug.log';
+                    file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Processing bounce with emailId: " . ($emailId ? $emailId : 'NULL') . "\n", FILE_APPEND | LOCK_EX);
                     $this->logger->debug("Processing bounce with emailId: " . ($emailId ? $emailId : 'NULL'));
                     
                     foreach ($bouncedRecipients as $bouncedRecipient) {
@@ -258,12 +266,14 @@ class CallbackSubscriber implements EventSubscriberInterface
                         $bounceCode       = 'AWS: '.$bounceSubType.': '.$bounceDiagnostic;
 
                         $cleanEmail = $this->cleanupEmailAddress($bouncedRecipient['emailAddress']);
+                        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Processing bounce for address={$cleanEmail}, emailId={$emailId}, bounceCode={$bounceCode}\n", FILE_APPEND | LOCK_EX);
                         $this->logger->debug("Processing bounce for address={$cleanEmail}, emailId={$emailId}");
                         
                         // Handle bounce with proper email stat correlation
                         $this->processBounceWithEmailId($cleanEmail, $bounceCode, $emailId);
                         
                         $this->logger->debug("Mark email '{$cleanEmail}' as bounced, reason: {$bounceCode}");
+                        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Completed bounce processing for {$cleanEmail}\n", FILE_APPEND | LOCK_EX);
                     }
                 }
                 break;
@@ -295,28 +305,37 @@ class CallbackSubscriber implements EventSubscriberInterface
 
     public function getEmailHeader($payload)
     {
+        $debugLogFile = '/tmp/mautic_sns_debug.log';
+        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] getEmailHeader called\n", FILE_APPEND | LOCK_EX);
+        
         $this->logger->debug('getEmailHeader called');
         
         if (!isset($payload['mail']['headers'])) {
             $this->logger->debug('No mail.headers found in payload');
+            file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] No mail.headers found in payload\n", FILE_APPEND | LOCK_EX);
             return null;
         }
 
-        $this->logger->debug('Found ' . count($payload['mail']['headers']) . ' headers in payload');
+        $headerCount = count($payload['mail']['headers']);
+        $this->logger->debug('Found ' . $headerCount . ' headers in payload');
+        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Found {$headerCount} headers in payload\n", FILE_APPEND | LOCK_EX);
         
         // Log all headers for debugging
         foreach ($payload['mail']['headers'] as $header) {
             $this->logger->debug('Header: ' . $header['name'] . ' = ' . $header['value']);
+            file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] Header: {$header['name']} = {$header['value']}\n", FILE_APPEND | LOCK_EX);
         }
 
         foreach ($payload['mail']['headers'] as $header) {
             if ('X-EMAIL-ID' === strtoupper($header['name'])) {
                 $this->logger->debug('Found X-EMAIL-ID header with value: ' . $header['value']);
+                file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] ✓ Found X-EMAIL-ID header with value: {$header['value']}\n", FILE_APPEND | LOCK_EX);
                 return $header['value'];
             }
         }
         
         $this->logger->debug('X-EMAIL-ID header not found');
+        file_put_contents($debugLogFile, "[" . date('Y-m-d H:i:s') . "] ✗ X-EMAIL-ID header not found\n", FILE_APPEND | LOCK_EX);
         return null;
     }
 
