@@ -302,6 +302,16 @@ class CallbackSubscriber implements EventSubscriberInterface
     {
         $this->logger->notice('getEmailHeader called');
         
+        // First try tags (SES Configuration Set tags are included in SNS notifications)
+        if (isset($payload['mail']['tags']) && isset($payload['mail']['tags']['email_id'])) {
+            $emailId = $payload['mail']['tags']['email_id'][0] ?? null;
+            if ($emailId) {
+                $this->logger->notice('Found email_id in tags: ' . $emailId);
+                return $emailId;
+            }
+        }
+        
+        // Then try headers (if they're included)
         if (!isset($payload['mail']['headers'])) {
             $this->logger->notice('No mail.headers found in payload');
             return null;
@@ -321,7 +331,7 @@ class CallbackSubscriber implements EventSubscriberInterface
             }
         }
         
-        $this->logger->notice('X-EMAIL-ID header not found');
+        $this->logger->notice('X-EMAIL-ID not found in tags or headers');
         return null;
     }
 
