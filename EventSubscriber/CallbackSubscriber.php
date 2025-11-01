@@ -55,43 +55,69 @@ class CallbackSubscriber implements EventSubscriberInterface
 
     public function processCallbackRequest(TransportWebhookEvent $event): void
     {
-        // Parse the payload to check if it's an SNS webhook
+        $payload = null;
+        $request = $event->getRequest();
+        
+        // Log raw webhook for debugging
+        $this->logger->info('Webhook received', [
+            'user_agent' => $request->headers->get('User-Agent'),
+            'content_length' => $request->headers->get('Content-Length'),
+            'raw_content_preview' => substr($request->getContent(), 0, 200)
+        ]);
+        
+        // Parse the payload
         try {
-            $snsreq  = $event->getRequest();
-            $payload = json_decode($snsreq->getContent(), true, 512, JSON_THROW_ON_ERROR);
+            $payload = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
         } catch (\Exception $e) {
             // Invalid JSON - not our webhook, let other handlers try
+            $this->logger->debug('SNS: Invalid JSON, not an SNS webhook');
             return;
         }
 
         // Check if this is an SNS webhook by looking for SNS-specific structure
-        // SNS webhooks have a "Type" field with specific values
-        if (!array_key_exists('Type', $payload)) {
-            // No "Type" field - not an SNS webhook
+        // SNS webhooks always have a "Type" field with specific values
+        $messageType = $payload['Type'] ?? null;
+        
+        if (!$messageType) {
+            // Not an SNS webhook, ignore silently
+            $this->logger->debug('Webhook does not have Type field - not an SNS webhook', [
+                'payload_keys' => array_keys($payload)
+            ]);
             return;
         }
 
         // Validate it's a known SNS Type
         $validSnsTypes = ['Notification', 'SubscriptionConfirmation', 'UnsubscribeConfirmation'];
-        if (!in_array($payload['Type'], $validSnsTypes)) {
+        if (!in_array($messageType, $validSnsTypes)) {
             // Has "Type" field but not a known SNS type - not our webhook
+            $this->logger->debug('Webhook has Type field but not a known SNS type', [
+                'type' => $messageType
+            ]);
             return;
         }
 
-        // This IS an SNS webhook! Process it regardless of transport configuration.
-        // If SES is configured (either as default or via MultipleTransport), we should handle it.
-        // If SES is NOT configured anywhere, we'll still process it (AWS is sending us webhooks
-        // so it must have been configured at some point - better to handle bounces/complaints).
-        
-        $this->logger->debug('start processCallbackRequest - Amazon SNS Webhook');
-
-        // Optional: Log if SES is not the default transport
+        // This is an SNS webhook - check if SES transport is configured
         $dsn = Dsn::fromString($this->coreParametersHelper->get('mailer_dsn'));
-        if (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME !== $dsn->getScheme()) {
-            $this->logger->info('Processing SNS webhook (SES is not the default transport, may be secondary transport)');
+        $isMainTransport = (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME === $dsn->getScheme());
+
+        $this->logger->info('SNS callback received', [
+            'type' => $messageType,
+            'is_main_transport' => $isMainTransport,
+            'user_agent' => $request->headers->get('User-Agent')
+        ]);
+
+        // For multi-transport setups: Process SNS webhooks even if not main transport
+        // We identify SNS webhooks by the Type field
+        if (!$isMainTransport) {
+            $this->logger->warning('Processing SNS webhook even though SES is not the main transport', [
+                'main_dsn_scheme' => $dsn->getScheme(),
+                'type' => $messageType
+            ]);
         }
 
-        $type = $payload['Type'];
+        $this->logger->debug('start processCallbackRequest - Amazon SNS Webhook');
+
+        $type = $messageType;
 
         $proces_json_res = $this->processJsonPayload($payload, $type);
 
