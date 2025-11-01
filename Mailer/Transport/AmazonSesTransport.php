@@ -281,12 +281,6 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
 
         $payload['ReplyToAddresses'] = $this->stringifyAddresses($this->setReplyTo($sentMessage));
 
-        // Add email_id tag from metadata for bounce correlation
-        $emailId = $this->getEmailIdFromMetadata($sentMessage->getMetadata());
-        if ($emailId !== null) {
-            $payload['EmailTags'][] = ['Name' => 'email_id', 'Value' => (string)$emailId];
-        }
-
         foreach ($sentMessage->getHeaders()->all() as $header) {
             if ($header instanceof MetadataHeader) {
                 $payload['EmailTags'][] = ['Name' => $header->getKey(), 'Value' => $header->getValue()];
@@ -426,11 +420,6 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
     {
         $emailId = $this->getEmailIdFromMetadata($email->getMetadata());
         if ($emailId !== null) {
-            // Add X-EMAIL-ID header for bounce correlation
-            if (!$email->getHeaders()->has('X-EMAIL-ID')) {
-                $email->getHeaders()->addTextHeader('X-EMAIL-ID', (string)$emailId);
-            }
-
             $emailEntity = $this->entityManager->getRepository(MauticEmailEntity::class)->find($emailId);
             if ($emailEntity) {
                 // Update From Address and Name
