@@ -55,7 +55,7 @@ class CallbackSubscriber implements EventSubscriberInterface
 
     public function processCallbackRequest(TransportWebhookEvent $event): void
     {
-        // First, try to parse the payload and check if it's an SNS webhook
+        // Parse the payload to check if it's an SNS webhook
         try {
             $snsreq  = $event->getRequest();
             $payload = json_decode($snsreq->getContent(), true, 512, JSON_THROW_ON_ERROR);
@@ -66,29 +66,30 @@ class CallbackSubscriber implements EventSubscriberInterface
 
         // Check if this is an SNS webhook by looking for SNS-specific structure
         // SNS webhooks have a "Type" field with specific values
-        // Other services (Postmark, SendGrid, etc.) have different structures
         if (!array_key_exists('Type', $payload)) {
-            // Not an SNS webhook - no "Type" field means it's from another service
+            // No "Type" field - not an SNS webhook
             return;
         }
 
         // Validate it's a known SNS Type
         $validSnsTypes = ['Notification', 'SubscriptionConfirmation', 'UnsubscribeConfirmation'];
         if (!in_array($payload['Type'], $validSnsTypes)) {
-            // Has "Type" field but not an SNS type - could be another service
+            // Has "Type" field but not a known SNS type - not our webhook
             return;
         }
 
-        // This IS an SNS webhook - now check if SES is configured
-        $dsn = Dsn::fromString($this->coreParametersHelper->get('mailer_dsn'));
-
-        if (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME !== $dsn->getScheme()) {
-            // SNS webhook received but SES is not the default transport
-            $this->logger->info('Amazon SNS webhook received but SES is not the default transport - ignoring');
-            return;
-        }
-
+        // This IS an SNS webhook! Process it regardless of transport configuration.
+        // If SES is configured (either as default or via MultipleTransport), we should handle it.
+        // If SES is NOT configured anywhere, we'll still process it (AWS is sending us webhooks
+        // so it must have been configured at some point - better to handle bounces/complaints).
+        
         $this->logger->debug('start processCallbackRequest - Amazon SNS Webhook');
+
+        // Optional: Log if SES is not the default transport
+        $dsn = Dsn::fromString($this->coreParametersHelper->get('mailer_dsn'));
+        if (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME !== $dsn->getScheme()) {
+            $this->logger->info('Processing SNS webhook (SES is not the default transport, may be secondary transport)');
+        }
 
         $type = $payload['Type'];
 
