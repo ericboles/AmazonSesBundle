@@ -25,7 +25,7 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
 {
     const DEFAULT_RATE = 14;
 
-    private static SesV2Client $amazonclient;
+    private static array $amazonclients = [];
     private static TranslatorInterface $translator;
     private PathsHelper $pathsHelper;
     private EntityManagerInterface $entityManager;
@@ -57,8 +57,9 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
     public function create(Dsn $dsn): TransportInterface
     {
         if (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME === $dsn->getScheme()) {
-            self::initAmazonClient($dsn);
-            $client = self::getAmazonClient();
+            $clientKey = self::getClientKey($dsn);
+            self::initAmazonClient($dsn, null, $clientKey);
+            $client = self::getAmazonClient($clientKey);
     
             $manualRate = $dsn->getOption('ratelimit');
     
@@ -175,24 +176,33 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
      }
 
     /**
+     * Generate a unique key for each AWS credential + region combination.
+     */
+    private static function getClientKey(Dsn $dsn): string
+    {
+        return md5($dsn->getUser().':'.$dsn->getPassword().':'.$dsn->getOption('region'));
+    }
+
+    /**
+     * @param string $clientKey
      * @return SesV2Client
      */
-    public static function getAmazonClient(): SesV2Client
+    public static function getAmazonClient(string $clientKey = ''): SesV2Client
     {
-        if (!isset(self::$amazonclient)) {
-            // throw new IncompleteDsnException('clientnotset');
+        if (!isset(self::$amazonclients[$clientKey])) {
             throw new IncompleteDsnException(self::$translator->trans('mautic.amazonses.plugin.amazonclient.notset', [], 'validators'));
         }
 
-        return self::$amazonclient;
+        return self::$amazonclients[$clientKey];
     }
 
     /**
      * @param Dsn $dsn
      * @param \Countable|null $handler
+     * @param string $clientKey
      * @return void
      */
-    public static function initAmazonClient(Dsn $dsn, ?\Countable $handler = null): void
+    public static function initAmazonClient(Dsn $dsn, ?\Countable $handler = null, string $clientKey = ''): void
     {
         $dsn_user = $dsn->getUser();
         if (null === $dsn_user) {
@@ -220,7 +230,7 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
             throw new InvalidArgumentException(self::$translator->trans('mautic.amazonses.plugin.ratelimit.invalid', [], 'validators'));
         }
 
-        if (!isset(self::$amazonclient)) {
+        if (!isset(self::$amazonclients[$clientKey])) {
             $config = [
                 'version'     => 'latest',
                 'credentials' => CredentialProvider::fromCredentials(new Credentials($dsn_user, $dsn_password)),
@@ -233,9 +243,9 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
             }
 
             /*
-             * Check singleton.
+             * Check per-credential/region client.
              */
-            self::$amazonclient = new SesV2Client($config);
+            self::$amazonclients[$clientKey] = new SesV2Client($config);
         }
     }
 
